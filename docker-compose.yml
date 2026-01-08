@@ -2,7 +2,7 @@ version: '3.8'
 
 services:
   mcs_output_encoders:
-    image: hopper212/mcs_output_encoders:latest
+    image: 212hopper/mcs_output_encoders:latest
     container_name: mcs_output_encoders
     environment:
       # MCS Configuration
