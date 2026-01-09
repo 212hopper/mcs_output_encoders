@@ -17,10 +17,6 @@ if not mcs_ip_primary or not mcs_ip_secondary:
 base_primary = f"https://{mcs_ip_primary}:{access_port}"
 base_secondary = f"https://{mcs_ip_secondary}:{access_port}"
 
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-token_file = os.path.join(SCRIPT_DIR, "tokens", "token_storage.json")
-os.makedirs(os.path.dirname(token_file), exist_ok=True)
-
 username = os.getenv('MCS_USERNAME')
 password = os.getenv('MCS_PASSWORD')
 
@@ -51,29 +47,49 @@ def get_jwt_exp(token):
 
 
 def load_token():
-    if not os.path.exists(token_file):
-        return None
     try:
-        with open(token_file, "r") as f:
-            data = json.load(f)
-        exp = get_jwt_exp(data.get("access_token", ""))
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT token_access, token_refresh, token_exp FROM dbo.mcs_admin WHERE id = 1")
+        row = cursor.fetchone()
+        conn.close()
+        
+        if not row or not row[0]:  # No row or token_access is null
+            return None
+        
+        token_access, token_refresh, token_exp = row
+        exp = int(token_exp) if token_exp else 0
+        
+        # Check if token is still valid (more than 60 seconds left)
         if exp and exp > time.time() + 60:
-            data["exp"] = exp
-            return data
+            return {
+                "access_token": token_access,
+                "refresh_token": token_refresh,
+                "exp": exp
+            }
     except Exception as e:
-        print(f"Token cache invalid: {e}")
+        print(f"Token load error: {e}")
+    
     return None
 
 
 def save_token(access_token, refresh_token):
-    exp = get_jwt_exp(access_token)
-    cache = {
-        "access_token": access_token,
-        "refresh_token": refresh_token,
-        "exp": exp
-    }
-    with open(token_file, "w") as f:
-        json.dump(cache, f, indent=2)
+    try:
+        exp = get_jwt_exp(access_token)
+        
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            UPDATE dbo.mcs_admin 
+            SET token_access = ?, token_refresh = ?, token_exp = ?
+            WHERE id = 1
+        """, (access_token, refresh_token, int(exp)))
+        conn.commit()
+        conn.close()
+        print("Token saved to database")
+    except Exception as e:
+        print(f"Token save error: {e}")
+        raise
 
 
 def login(base_url):
