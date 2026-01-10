@@ -46,11 +46,32 @@ def get_jwt_exp(token):
         return 0
 
 
-def load_token():
+def get_db_connection():
+    return pyodbc.connect(
+        f'Driver={{ODBC Driver 18 for SQL Server}};'
+        f'Server={SQL_SERVER};'
+        f'Database={SQL_DATABASE};'
+        f'UID={SQL_USERNAME};'
+        f'PWD={SQL_PASSWORD};'
+        f'TrustServerCertificate=yes;'
+    )
+
+
+def get_token_columns(base_url):
+    """Return the column names for the given base_url"""
+    if base_url == base_primary:
+        return "token_access_primary", "token_refresh_primary", "token_exp_primary"
+    else:
+        return "token_access_secondary", "token_refresh_secondary", "token_exp_secondary"
+
+
+def load_token(base_url):
     try:
+        access_col, refresh_col, exp_col = get_token_columns(base_url)
+        
         conn = get_db_connection()
         cursor = conn.cursor()
-        cursor.execute("SELECT token_access, token_refresh, token_exp FROM dbo.mcs_admin WHERE id = 1")
+        cursor.execute(f"SELECT {access_col}, {refresh_col}, {exp_col} FROM dbo.mcs_admin WHERE id = 1")
         row = cursor.fetchone()
         conn.close()
         
@@ -73,20 +94,22 @@ def load_token():
     return None
 
 
-def save_token(access_token, refresh_token):
+def save_token(access_token, refresh_token, base_url):
     try:
         exp = get_jwt_exp(access_token)
+        access_col, refresh_col, exp_col = get_token_columns(base_url)
         
         conn = get_db_connection()
         cursor = conn.cursor()
-        cursor.execute("""
+        cursor.execute(f"""
             UPDATE dbo.mcs_admin 
-            SET token_access = ?, token_refresh = ?, token_exp = ?
+            SET {access_col} = ?, {refresh_col} = ?, {exp_col} = ?
             WHERE id = 1
         """, (access_token, refresh_token, int(exp)))
         conn.commit()
         conn.close()
-        print("Token saved to database")
+        server = "PRIMARY" if base_url == base_primary else "SECONDARY"
+        print(f"Token saved to database ({server})")
     except Exception as e:
         print(f"Token save error: {e}")
         raise
@@ -104,16 +127,16 @@ def login(base_url):
     )
     r.raise_for_status()
     data = r.json()["data"]
-    save_token(data["access_token"], data["refresh_token"])
+    save_token(data["access_token"], data["refresh_token"], base_url)
     return data["access_token"]
 
 
-def refresh_token(base_url, refresh_token):
+def refresh_token(base_url, refresh_token_str):
     print("Refreshing access token...")
     url = f"{base_url}/api/5.1/auth/token/refresh"
     r = requests.post(
         url,
-        json={"refresh_token": refresh_token},
+        json={"refresh_token": refresh_token_str},
         headers={"accept": "application/json", "content-type": "application/json"},
         verify=False,
         timeout=10
@@ -121,58 +144,58 @@ def refresh_token(base_url, refresh_token):
     if r.status_code >= 400:
         raise Exception("Refresh failed")
     data = r.json()["data"]
-    save_token(data["access_token"], data["refresh_token"])
+    save_token(data["access_token"], data["refresh_token"], base_url)
     return data["access_token"]
 
 
 # === Global token cache ===
-_cached_token = None
-_refresh_token = None
+_cached_tokens = {}  # Store tokens per base_url
+_refresh_tokens = {}  # Store refresh tokens per base_url
 
 
-def get_valid_token():
-    global _cached_token, _refresh_token
+def get_valid_token(base_url):
+    """Get valid token for the given base_url"""
+    global _cached_tokens, _refresh_tokens
 
-    cache = load_token()
+    cache = load_token(base_url)
     if cache:
-        _cached_token = cache["access_token"]
-        _refresh_token = cache["refresh_token"]
+        _cached_tokens[base_url] = cache["access_token"]
+        _refresh_tokens[base_url] = cache["refresh_token"]
 
-    for base in [base_primary, base_secondary]:
-        # Try refresh first if we have a refresh token
-        if _refresh_token:
-            try:
-                _cached_token = refresh_token(base, _refresh_token)
-                return _cached_token
-            except:
-                print("Refresh failed, will try login")
-
-        # Fall back to full login
+    # Try refresh first if we have a refresh token
+    if base_url in _refresh_tokens:
         try:
-            _cached_token = login(base)
-            cache = load_token()
-            if cache:
-                _refresh_token = cache["refresh_token"]
-            return _cached_token
-        except Exception as e:
-            print(f"Login failed on {base}: {e}")
+            _cached_tokens[base_url] = refresh_token(base_url, _refresh_tokens[base_url])
+            return _cached_tokens[base_url]
+        except:
+            print("Refresh failed, will try login")
 
-    raise Exception("Could not authenticate to either MCS")
+    # Fall back to full login
+    try:
+        _cached_tokens[base_url] = login(base_url)
+        cache = load_token(base_url)
+        if cache:
+            _refresh_tokens[base_url] = cache["refresh_token"]
+        return _cached_tokens[base_url]
+    except Exception as e:
+        print(f"Login failed on {base_url}: {e}")
+        raise Exception("Could not authenticate to MCS")
 
 
-def bearer_token():
-    global _cached_token
-    if not _cached_token:
-        _cached_token = get_valid_token()
-    return _cached_token
+def bearer_token(base_url):
+    """Get bearer token for the given base_url"""
+    global _cached_tokens
+    if base_url not in _cached_tokens or not _cached_tokens[base_url]:
+        _cached_tokens[base_url] = get_valid_token(base_url)
+    return _cached_tokens[base_url]
 
 
 def send_api_get_call(full_path, base_url=base_primary):
-    global _cached_token
+    global _cached_tokens
 
     url = base_url + full_path
     headers = {
-        "Authorization": f"Bearer {bearer_token()}",
+        "Authorization": f"Bearer {bearer_token(base_url)}",
         "Accept": "application/json"
     }
 
@@ -180,8 +203,8 @@ def send_api_get_call(full_path, base_url=base_primary):
         r = requests.get(url, headers=headers, verify=False, timeout=15)
         if r.status_code == 401:
             print("401 Unauthorized → forcing token refresh")
-            _cached_token = None
-            headers["Authorization"] = f"Bearer {bearer_token()}"
+            _cached_tokens[base_url] = None
+            headers["Authorization"] = f"Bearer {bearer_token(base_url)}"
             r = requests.get(url, headers=headers, verify=False, timeout=15)
         r.raise_for_status()
         return r.json()
@@ -193,11 +216,11 @@ def send_api_get_call(full_path, base_url=base_primary):
 
 
 def send_api_put_call(full_path, json_payload, base_url=base_primary):
-    global _cached_token
+    global _cached_tokens
 
     url = base_url + full_path
     headers = {
-        "Authorization": f"Bearer {bearer_token()}",
+        "Authorization": f"Bearer {bearer_token(base_url)}",
         "Accept": "application/json"
     }
 
@@ -205,8 +228,8 @@ def send_api_put_call(full_path, json_payload, base_url=base_primary):
         r = requests.put(url, headers=headers, verify=False, timeout=15, json=json_payload)
         if r.status_code == 401:
             print("401 Unauthorized → forcing token refresh")
-            _cached_token = None
-            headers["Authorization"] = f"Bearer {bearer_token()}"
+            _cached_tokens[base_url] = None
+            headers["Authorization"] = f"Bearer {bearer_token(base_url)}"
             r = requests.put(url, headers=headers, verify=False, timeout=15, json=json_payload)
         r.raise_for_status()
         return r.json()
