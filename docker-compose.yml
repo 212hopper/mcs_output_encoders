@@ -2,7 +2,7 @@ version: '3.8'
 
 services:
   mcs_output_encoders:
-    image: 212hopper/mcs_output_encoders:latest
+    image: hopper212/mcs_output_encoders:latest
     container_name: mcs_output_encoders
     environment:
       # MCS Configuration
@@ -18,24 +18,10 @@ services:
       SQL_USERNAME: "sa"
       SQL_PASSWORD: "daznTXE123!"
     
-    volumes:
-      # Persist token storage between restarts
-      - dolby-tokens:/app/tokens
-    
     networks:
       - broadcast-network
     
     restart: unless-stopped
-    
-    # Optional: Set resource limits
-    # deploy:
-    #   resources:
-    #     limits:
-    #       cpus: '0.5'
-    #       memory: 512M
-
-volumes:
-  dolby-tokens:
 
 networks:
   broadcast-network:

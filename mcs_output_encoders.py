@@ -293,18 +293,28 @@ def get_db_connection():
     )
 
 
-# === Database Functions ===
 def get_devices_table():
     print("Fetching devices and updating database...")
     device_list = get_all_devices()
     devices_to_store = []
+    groups_to_store = []
     
     for device in device_list.get("data", []):
+        device_uuid = device.get("uuid")
+        
         devices_to_store.append({
-            "Device_UUID": device.get("uuid"),
+            "Device_UUID": device_uuid,
             "Device_Label": device.get("label"),
             "Device_IP": device.get("access", {}).get("url")
         })
+        
+        # Extract groups and create separate records
+        groups = device.get("settings", {}).get("groups", [])
+        for group in groups:
+            groups_to_store.append({
+                "Device_UUID": device_uuid,
+                "Group_Label": group.get("label", "")
+            })
     
     try:
         conn = get_db_connection()
@@ -329,14 +339,25 @@ def get_devices_table():
                 single_device['Device_IP']
             ))
         
+        # Delete old groups for this device, then insert new ones
+        for device_uuid in [d['Device_UUID'] for d in devices_to_store]:
+            cursor.execute("DELETE FROM dbo.mcs_device_groups WHERE device_uuid = ?", (device_uuid,))
+        
+        # Insert groups
+        for group in groups_to_store:
+            cursor.execute("""
+                INSERT INTO dbo.mcs_device_groups (device_uuid, group_label)
+                VALUES (?, ?)
+            """, (group['Device_UUID'], group['Group_Label']))
+        
         conn.commit()
         conn.close()
         print(f"Updated {len(devices_to_store)} devices in database")
+        print(f"Updated {len(groups_to_store)} group assignments")
         return devices_to_store
     except Exception as e:
         print(f"Database error in get_devices_table: {e}")
         raise
-
 
 def get_devices_status():
     print("Fetching device status and updating database...")
