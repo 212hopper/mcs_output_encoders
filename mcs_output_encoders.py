@@ -440,6 +440,108 @@ def get_output_per_mcm():
 def get_mcm_outputs():
     print("Fetching MCM encoder outputs and updating database...")
     mcm_outputs_to_store = []
+    successfully_queried_ips = []  # Track which devices responded
+
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT ip, status FROM dbo.mcs_mcm_list")
+        devices = cursor.fetchall()
+        conn.close()
+
+        for device_ip, device_status in devices:
+            if device_status == "Up":
+                print(f"Getting encoder info for {device_ip}")
+                try:
+                    get_encoder_info = requests.get(
+                        f"http://{device_ip}/api/2.0/outputs/config/.json",
+                        auth=("Admin", "Admin"),
+                        timeout=10,
+                        verify=False
+                    ).json()
+
+                    # Only mark as successfully queried if we got a valid response
+                    successfully_queried_ips.append(device_ip)
+
+                    for encoder_item in get_encoder_info:
+                        encoder_uuid = encoder_item["Encoder"]["uuid"]
+                        encoder_id = encoder_item["Encoder"]["id"]
+                        encoder_title = encoder_item["Encoder"]["title"]
+                        encoder_enabled = encoder_item["Encoder"]["is_enabled"]
+                        uuid = f"{device_ip}_{encoder_uuid}"
+
+                        mcm_outputs_to_store.append({
+                            "Encoder_UUID": encoder_uuid,
+                            "Encoder_ID": encoder_id,
+                            "Encoder_Title": encoder_title,
+                            "Encoder_Enabled": encoder_enabled,
+                            "UUID": uuid,
+                            "Device_IP": device_ip  # Store for scoped delete
+                        })
+                except Exception as e:
+                    print(f"Error fetching encoder info from {device_ip}: {e}")
+                    # ⚠️ Do NOT add to successfully_queried_ips
+                    # This preserves existing rows for devices we couldn't reach
+
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        # Only clean up rows for devices we SUCCESSFULLY queried
+        # This avoids wiping data for devices that were temporarily unreachable
+        if successfully_queried_ips:
+            placeholders = ','.join(['?' for _ in successfully_queried_ips])
+            
+            # Delete rows where the uuid starts with a successfully queried IP
+            # but was NOT in the fresh data (i.e., encoder no longer exists)
+            fresh_uuids = [o['UUID'] for o in mcm_outputs_to_store]
+            
+            cursor.execute(f"""
+                DELETE FROM dbo.mcs_mcm_outputs
+                WHERE (
+                    {' OR '.join([f"uuid LIKE ?" for _ in successfully_queried_ips])}
+                )
+                {f"AND uuid NOT IN ({','.join(['?' for _ in fresh_uuids])})" 
+                 if fresh_uuids else ""}
+            """, 
+            [f"{ip}_%" for ip in successfully_queried_ips] + 
+            (fresh_uuids if fresh_uuids else [])
+            )
+
+        # Insert/update fresh data
+        for single_output in mcm_outputs_to_store:
+            cursor.execute("""
+                MERGE INTO dbo.mcs_mcm_outputs AS target
+                USING (SELECT ? AS uuid) AS source
+                ON target.uuid = source.uuid
+                WHEN MATCHED THEN
+                    UPDATE SET encoder_label = ?, encoder_uuid = ?, 
+                               enabled = ?, encoder_id = ?
+                WHEN NOT MATCHED THEN
+                    INSERT (uuid, encoder_label, encoder_uuid, enabled, encoder_id)
+                    VALUES (?, ?, ?, ?, ?);
+            """, (
+                single_output['UUID'],
+                single_output['Encoder_Title'],
+                single_output['Encoder_UUID'],
+                single_output['Encoder_Enabled'],
+                single_output['Encoder_ID'],
+                single_output['UUID'],
+                single_output['Encoder_Title'],
+                single_output['Encoder_UUID'],
+                single_output['Encoder_Enabled'],
+                single_output['Encoder_ID']
+            ))
+
+        conn.commit()
+        conn.close()
+        print(f"Updated {len(mcm_outputs_to_store)} MCM outputs in database")
+        print(f"Cleaned up stale records for {len(successfully_queried_ips)} devices")
+
+    except Exception as e:
+        print(f"Database error in get_mcm_outputs: {e}")
+        raise
+    print("Fetching MCM encoder outputs and updating database...")
+    mcm_outputs_to_store = []
     
     try:
         conn = get_db_connection()
